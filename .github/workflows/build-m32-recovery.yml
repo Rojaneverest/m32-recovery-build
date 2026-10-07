@@ -49,6 +49,16 @@ jobs:
           chmod +x device/samsung/m32/mkbootimg
           df -h .
 
+      - name: Fix device-tree archive command for the Android build environment
+        run: |
+          cd "$GITHUB_WORKSPACE/twrp"
+          test -x /usr/bin/tar
+          /usr/bin/tar --version
+          python3 -c 'from pathlib import Path; p=Path("device/samsung/m32/bootimg.mk"); s=p.read_text(); old="tar -H ustar"; assert s.count(old)==1, "Unexpected device-tree packaging rule"; p.write_text(s.replace(old,"/usr/bin/tar --format=ustar"))'
+          git -C device/samsung/m32 diff --check
+          git -C device/samsung/m32 diff -- bootimg.mk > "$GITHUB_WORKSPACE/device-tree-local.patch"
+          cat "$GITHUB_WORKSPACE/device-tree-local.patch"
+
       - name: Build recovery only
         run: |
           exec > >(tee "$GITHUB_WORKSPACE/build.log") 2>&1
@@ -77,6 +87,7 @@ jobs:
           tar --format=ustar -C "$GITHUB_WORKSPACE/artifacts" \
             -cf "$GITHUB_WORKSPACE/artifacts/recovery.tar" recovery.img
           cp "$GITHUB_WORKSPACE/source-manifest.xml" "$GITHUB_WORKSPACE/artifacts/"
+          cp "$GITHUB_WORKSPACE/device-tree-local.patch" "$GITHUB_WORKSPACE/artifacts/"
           cd "$GITHUB_WORKSPACE/artifacts"
           sha256sum recovery.img recovery.tar > SHA256SUMS.txt
           printf '%s\n' \
@@ -103,5 +114,6 @@ jobs:
             build.log
             source-sync.log
             source-manifest.xml
+            device-tree-local.patch
           if-no-files-found: ignore
           retention-days: 7
