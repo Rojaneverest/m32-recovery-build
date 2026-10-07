@@ -1,0 +1,107 @@
+name: Build experimental M32 recovery
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Free space on the disposable GitHub runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost
+          df -h .
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git gnupg flex bison build-essential zip curl \
+            zlib1g-dev libc6-dev-i386 libx11-dev lib32z1-dev libgl1-mesa-dev \
+            libxml2-utils xsltproc unzip fontconfig python3 python-is-python3 \
+            libncurses5 rsync lz4 cpio
+          mkdir -p "$GITHUB_WORKSPACE/bin"
+          curl --fail --location https://storage.googleapis.com/git-repo-downloads/repo \
+            --output "$GITHUB_WORKSPACE/bin/repo"
+          chmod +x "$GITHUB_WORKSPACE/bin/repo"
+          echo "$GITHUB_WORKSPACE/bin" >> "$GITHUB_PATH"
+          git config --global user.name 'M32 recovery builder'
+          git config --global user.email 'builder@localhost'
+
+      - name: Download TWRP Android 11 source
+        run: |
+          exec > >(tee "$GITHUB_WORKSPACE/source-sync.log") 2>&1
+          mkdir -p "$GITHUB_WORKSPACE/twrp"
+          cd "$GITHUB_WORKSPACE/twrp"
+          repo init --depth=1 --no-clone-bundle \
+            -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git \
+            -b twrp-11
+          repo sync -c -j4 --no-clone-bundle --no-tags --fail-fast
+          repo manifest -r -o "$GITHUB_WORKSPACE/source-manifest.xml"
+          git clone https://github.com/akhil1999/twrp_device_samsung_m32.git device/samsung/m32
+          git -C device/samsung/m32 checkout ac3c9608ae256ecbade82edd73a4ff9be8199402
+          chmod +x device/samsung/m32/mkbootimg
+          df -h .
+
+      - name: Build recovery only
+        run: |
+          exec > >(tee "$GITHUB_WORKSPACE/build.log") 2>&1
+          cd "$GITHUB_WORKSPACE/twrp"
+          set +u
+          export ALLOW_MISSING_DEPENDENCIES=true
+          source build/envsetup.sh
+          lunch twrp_m32-eng
+          set -o pipefail
+          make -j2 recoveryimage
+
+      - name: Collect experimental recovery and checksums
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          cp "$GITHUB_WORKSPACE/twrp/out/target/product/m32/recovery.img" "$GITHUB_WORKSPACE/artifacts/"
+          test -s "$GITHUB_WORKSPACE/artifacts/recovery.img"
+          test "$(stat -c %s "$GITHUB_WORKSPACE/artifacts/recovery.img")" -le 50331648
+          python3 -c 'import sys,struct,json,pathlib; b=pathlib.Path(sys.argv[1]).read_bytes(); assert b[:8]==b"ANDROID!", "Bad boot magic"; v=struct.unpack_from("<10I",b,8); assert v[7]==2048 and v[8]==2, "Unexpected recovery header"; print(json.dumps(dict(zip(["kernel_size","kernel_addr","ramdisk_size","ramdisk_addr","second_size","second_addr","tags_addr","page_size","header_version","os_version"],v)),indent=2)); print("image_bytes",len(b)); print("AVB_footer_present",b[-64:-60]==b"AVBf")' \
+            "$GITHUB_WORKSPACE/artifacts/recovery.img" \
+            > "$GITHUB_WORKSPACE/artifacts/recovery-header.txt"
+          file "$GITHUB_WORKSPACE/artifacts/recovery.img" \
+            "$GITHUB_WORKSPACE/twrp/device/samsung/m32/prebuilt/"* \
+            > "$GITHUB_WORKSPACE/artifacts/file-types.txt"
+          git -C "$GITHUB_WORKSPACE/twrp/device/samsung/m32" rev-parse HEAD \
+            > "$GITHUB_WORKSPACE/artifacts/device-tree-commit.txt"
+          tar --format=ustar -C "$GITHUB_WORKSPACE/artifacts" \
+            -cf "$GITHUB_WORKSPACE/artifacts/recovery.tar" recovery.img
+          cp "$GITHUB_WORKSPACE/source-manifest.xml" "$GITHUB_WORKSPACE/artifacts/"
+          cd "$GITHUB_WORKSPACE/artifacts"
+          sha256sum recovery.img recovery.tar > SHA256SUMS.txt
+          printf '%s\n' \
+            'EXPERIMENTAL: built from akhil1999 M32 source, commit ac3c9608ae256ecbade82edd73a4ff9be8199402.' \
+            'Not tested on SM-M325F firmware M325FXXSDDYE3.' \
+            'A successful build does not prove it boots or flashes safely.' \
+            'This device tree disables data decryption.' \
+            'No LineageOS image or verified-boot patch is included.' > READ-ME-FIRST.txt
+
+      - name: Upload recovery files
+        uses: actions/upload-artifact@v4
+        with:
+          name: experimental-m32-recovery
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload build log and source manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m32-build-diagnostics
+          path: |
+            build.log
+            source-sync.log
+            source-manifest.xml
+          if-no-files-found: ignore
+          retention-days: 7
